@@ -1,32 +1,29 @@
 # Outline → Telegram Backup
 
-Automated backup of your [Outline](https://www.getoutline.com/) workspace. Exports all documents as markdown + media.
+Automated backup of your [Outline](https://www.getoutline.com/) workspace using the native export API.
 
 ## How It Works
 
-- **Text-only archive** (markdown) → sent to Telegram
-- **Full archive** (markdown + media files) → saved locally only
+Uses Outline's `collections.export` API to export each collection as a complete zip:
+- ✅ Markdown documents (current state)
+- ✅ All media files (images, attachments)
+- ✅ Proper folder structure (collections → documents → uploads)
 
-Telegram has a 50 MB limit, so media-heavy workspaces use local storage for the complete backup.
+Full zips saved locally. Summary sent to Telegram.
 
 ## Quick Start
 
 ### 1. Create a Telegram Bot
 
-1. Open Telegram, search for **@BotFather**
-2. Send `/newbot`
-3. Copy the bot token
+Search **@BotFather** → `/newbot` → copy token
 
-### 2. Get Your Chat ID
+### 2. Get Chat ID
 
-1. Add the bot to your group (as admin)
-2. Send any message
-3. Open `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-4. Find `"chat":{"id": -100...}` — that's your chat ID
+Add bot to your group (as admin) → send message → open `https://api.telegram.org/bot<TOKEN>/getUpdates` → find `"chat":{"id": -100...}`
 
 ### 3. Get Outline API Key
 
-Go to your Outline instance → **Settings** → **API** → Generate token
+Settings → API → Generate token
 
 ### 4. Run
 
@@ -34,11 +31,11 @@ Go to your Outline instance → **Settings** → **API** → Generate token
 git clone https://github.com/silentboy04/outline-telegram-backup.git
 cd outline-telegram-backup
 cp .env.example .env
-# Edit .env with your tokens
+# edit .env
 docker compose up --build
 ```
 
-### 5. Schedule Weekly (crontab)
+### 5. Schedule Weekly
 
 ```bash
 0 3 * * 0 cd /path/to/outline-telegram-backup && docker compose up --build
@@ -53,7 +50,13 @@ docker compose up --build
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Yes | Target chat/group ID |
 | `TELEGRAM_THREAD_ID` | No | Topic/thread ID for supergroups |
-| `KEEP_BACKUPS` | No | Max archives to keep (default: 4) |
+| `LOCAL_BACKUP_DIR` | No | Local path for full backups (default: /data/backups/local) |
+| `KEEP_BACKUPS` | No | Max backup sets to keep (default: 4) |
+
+## Limits
+
+- Native full-workspace export has a 3.82 GB limit (Outline server-side). This tool exports per-collection, avoiding that limit.
+- Telegram file upload limit: 50 MB. Full zips >50 MB are saved locally only; summary goes to Telegram.
 
 ## License
 
