@@ -1,0 +1,11 @@
+services:
+  outline-backup:
+    build: .
+    container_name: outline-backup
+    restart: "no"
+    env_file: .env
+    volumes:
+      - backup-data:/data/backups
+
+volumes:
+  backup-data:
