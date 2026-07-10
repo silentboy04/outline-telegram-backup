@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Outline → Telegram Backup
-Exports all Outline docs as markdown + media.
-- Text-only archive → sent to Telegram
-- Full archive (text+media) → saved locally only
+Outline → Telegram Backup (v2)
+Uses native Outline export API per collection.
+- Full zip (markdown + media) → saved locally
+- Text-only summary → sent to Telegram
 """
 
 import os
 import sys
-import re
 import json
 import time
-import tarfile
 import shutil
 import logging
+import zipfile
 import requests
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 
 # ── Config ────────────────────────────────────────────────────────────
 OUTLINE_URL = os.environ["OUTLINE_URL"].rstrip("/")
@@ -25,7 +24,6 @@ OUTLINE_API_KEY = os.environ["OUTLINE_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TELEGRAM_THREAD_ID = os.environ.get("TELEGRAM_THREAD_ID", "")
-BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/data/backups"))
 LOCAL_BACKUP_DIR = Path(os.environ.get("LOCAL_BACKUP_DIR", "/data/backups/local"))
 KEEP_BACKUPS = int(os.environ.get("KEEP_BACKUPS", "4"))
 
@@ -36,7 +34,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("outline-backup")
 
-# ── Outline REST API helpers ──────────────────────────────────────────
+
+# ── Outline API ───────────────────────────────────────────────────────
 
 def api(endpoint: str, payload: dict = None) -> dict:
     url = f"{OUTLINE_URL}/api/{endpoint}"
@@ -49,183 +48,134 @@ def api(endpoint: str, payload: dict = None) -> dict:
     return resp.json()
 
 
-def list_collections() -> list:
-    cols = []
-    while True:
-        data = api("collections.list", {"limit": 100, "offset": len(cols)})
-        batch = data.get("data", [])
-        cols.extend(batch)
-        if len(batch) < 100:
-            break
-    return cols
-
-
-def list_documents(collection_id: str) -> list:
-    docs = []
-    payload = {
-        "collectionId": collection_id,
-        "limit": 100,
-        "sort": "title",
-        "direction": "asc",
-    }
-    while True:
-        data = api("documents.list", payload)
-        batch = data.get("data", [])
-        docs.extend(batch)
-        if len(batch) < 100:
-            break
-        payload["offset"] = len(docs)
-    return docs
-
-
-def get_document(doc_id: str) -> dict:
-    data = api("documents.info", {"id": doc_id})
-    return data.get("data", {})
-
-
-def download_attachment(attachment_id: str, save_path: Path) -> bool:
-    url = f"{OUTLINE_URL}/api/attachments.redirect"
+def api_download(url: str) -> bytes:
     headers = {"Authorization": f"Bearer {OUTLINE_API_KEY}"}
-    try:
-        resp = requests.get(
-            url, params={"id": attachment_id}, headers=headers,
-            timeout=30, allow_redirects=True,
-        )
-        if resp.status_code == 200 and len(resp.content) > 0:
-            save_path.parent.mkdir(parents=True, exist_ok=True)
-            save_path.write_bytes(resp.content)
-            return True
-    except Exception as e:
-        log.warning("    Download failed %s: %s", attachment_id, e)
-    return False
+    resp = requests.get(url, headers=headers, timeout=300, allow_redirects=True)
+    resp.raise_for_status()
+    return resp.content
 
 
-# ── Media extraction ──────────────────────────────────────────────────
-
-ATTACHMENT_RE = re.compile(
-    r'!\[([^\]]*)\]\((/api/attachments\.redirect\?id=([a-f0-9-]+)[^)]*)\)'
-)
+def list_collections() -> list:
+    return api("collections.list", {"limit": 100}).get("data", [])
 
 
-def extract_attachments(text: str) -> list[tuple[str, str, str]]:
-    return ATTACHMENT_RE.findall(text)
+def export_collection(col_id: str) -> str:
+    """Trigger export for a collection, return fileOperation ID."""
+    data = api("collections.export", {"id": col_id, "format": "outline-markdown"})
+    op = data.get("data", {}).get("fileOperation", {})
+    if not op.get("id"):
+        raise RuntimeError(f"Export failed: {data}")
+    return op["id"]
 
 
-def rewrite_media_paths(text: str) -> str:
-    def replacer(m):
-        alt, _, att_id = m.group(1), m.group(2), m.group(3)
-        return f"![{alt}](media/{att_id})"
-    return ATTACHMENT_RE.sub(replacer, text)
+def wait_export(op_id: str, timeout: int = 300) -> dict:
+    """Poll fileOperations.info until complete. Returns the fileOperation."""
+    start = time.time()
+    while time.time() - start < timeout:
+        data = api("fileOperations.info", {"id": op_id})
+        op = data.get("data", {})
+        state = op.get("state")
+        if state == "complete":
+            return op
+        elif state == "error":
+            raise RuntimeError(f"Export error: {op.get('error')}")
+        log.info("    ⏳ waiting for export... (%s)", state)
+        time.sleep(3)
+    raise TimeoutError(f"Export timed out after {timeout}s")
+
+
+def download_export(op_id: str) -> bytes:
+    """Download exported zip."""
+    url = f"{OUTLINE_URL}/api/fileOperations.redirect?id={op_id}"
+    return api_download(url)
 
 
 # ── Backup logic ──────────────────────────────────────────────────────
 
-def sanitize(name: str) -> str:
-    return "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip()
+def extract_text_only(zip_data: bytes, save_path: Path):
+    """Extract zip but exclude uploads/ directories (media), re-zip as text-only."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        src_zip = Path(tmpdir) / "src.zip"
+        src_zip.write_bytes(zip_data)
+
+        extract_dir = Path(tmpdir) / "extract"
+        with zipfile.ZipFile(src_zip) as zf:
+            zf.extractall(extract_dir)
+
+        # Write text-only zip (exclude uploads/ dirs)
+        with zipfile.ZipFile(save_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for f in sorted(extract_dir.rglob("*")):
+                if f.is_file() and "uploads" not in str(f):
+                    arcname = str(f.relative_to(extract_dir))
+                    zout.write(f, arcname)
 
 
-def do_backup() -> tuple[str, str, str]:
+def do_backup() -> tuple[dict, str]:
     """
-    Returns (text_archive_path, full_archive_path, summary_text).
+    Returns (collection_stats_dict, summary_text).
+    Saves full zips to LOCAL_BACKUP_DIR.
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-    work_dir = BACKUP_DIR / f"outline-backup-{ts}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-    doc_count = 0
-    media_count = 0
-    col_count = 0
+    backup_dir = LOCAL_BACKUP_DIR / f"outline-export-{ts}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("Fetching collections...")
     collections = list_collections()
     log.info("Found %d collections", len(collections))
 
+    stats = {}
     for col in collections:
-        col_name = col.get("name", "unnamed")
-        col_dir = work_dir / sanitize(col_name)
-        col_dir.mkdir(exist_ok=True)
-        col_count += 1
+        col_name = col["name"]
+        col_id = col["id"]
+        log.info("  📁 %s — exporting...", col_name)
+        try:
+            op_id = export_collection(col_id)
+            op = wait_export(op_id)
+            size = int(op.get("size", 0))
+            log.info("  ✓ %s — %.1f MB", col_name, size / 1024 / 1024)
 
-        log.info("  Collection: %s", col_name)
-        docs = list_documents(col["id"])
-        log.info("    %d documents", len(docs))
+            # Download full zip
+            zip_data = download_export(op_id)
+            zip_name = f"{col_name.replace(' ', '_')}.zip"
+            zip_path = backup_dir / zip_name
+            zip_path.write_bytes(zip_data)
 
-        for doc in docs:
-            title = doc.get("title", "untitled")
-            doc_id = doc["id"]
-            try:
-                full = get_document(doc_id)
-                text = full.get("text", "")
+            # Count files in zip
+            with zipfile.ZipFile(zip_path) as zf:
+                total_files = len(zf.namelist())
+                media_files = sum(1 for n in zf.namelist() if "uploads" in n)
 
-                # Extract & download media
-                attachments = extract_attachments(text)
-                media_dir = col_dir / "media"
-                if attachments:
-                    media_dir.mkdir(exist_ok=True)
+            stats[col_name] = {
+                "files": total_files,
+                "media": media_files,
+                "size_mb": len(zip_data) / 1024 / 1024,
+                "zip_path": str(zip_path),
+            }
+        except Exception as e:
+            log.error("  ✗ %s: %s", col_name, e)
+            stats[col_name] = {"error": str(e)}
+        time.sleep(1)
 
-                for alt, url, att_id in attachments:
-                    ext = ".bin"
-                    if "type=" in url:
-                        try:
-                            params = parse_qs(urlparse(url).query)
-                            mime = params.get("type", [""])[0]
-                            ext_map = {
-                                "image/png": ".png", "image/jpeg": ".jpg",
-                                "image/gif": ".gif", "image/webp": ".webp",
-                                "application/pdf": ".pdf",
-                            }
-                            ext = ext_map.get(mime, ext)
-                        except Exception:
-                            pass
-                    save_path = media_dir / f"{att_id}{ext}"
-                    if not save_path.exists():
-                        if download_attachment(att_id, save_path):
-                            media_count += 1
-                            log.info("    📎 %s%s", att_id[:8], ext)
-                        time.sleep(0.2)
+    total_files = sum(s.get("files", 0) for s in stats.values())
+    total_media = sum(s.get("media", 0) for s in stats.values())
+    total_size = sum(s.get("size_mb", 0) for s in stats.values())
 
-                # Rewrite media paths in markdown
-                text = rewrite_media_paths(text)
+    lines = [
+        f"📦 Outline Backup — {ts}",
+        f"• Collections: {len(stats)}",
+        f"• Total files: {total_files} ({total_media} media)",
+        f"• Total size: {total_size:.1f} MB",
+        "",
+    ]
+    for col_name, s in stats.items():
+        if "error" in s:
+            lines.append(f"❌ {col_name}: {s['error']}")
+        else:
+            lines.append(f"  ✓ {col_name}: {s['files']} files ({s['media']} media), {s['size_mb']:.1f} MB")
+    lines.append(f"\n💾 Saved to: {backup_dir}")
 
-                fname = sanitize(title) + ".md"
-                (col_dir / fname).write_text(text, encoding="utf-8")
-                doc_count += 1
-                log.info("    ✓ %s", title)
-            except Exception as e:
-                log.warning("    ✗ %s: %s", title, e)
-            time.sleep(0.3)
-
-    # ── Full archive (text + media) → local only ──
-    full_name = f"outline-full-{ts}.tar.gz"
-    full_path = LOCAL_BACKUP_DIR / full_name
-    LOCAL_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(full_path, "w:gz") as tar:
-        tar.add(work_dir, arcname=f"outline-backup-{ts}")
-    full_mb = full_path.stat().st_size / 1024 / 1024
-    log.info("Full archive: %s (%.1f MB)", full_name, full_mb)
-
-    # ── Text-only archive (no media) → for Telegram ──
-    text_dir = BACKUP_DIR / f"outline-text-{ts}"
-    shutil.copytree(work_dir, text_dir, ignore=shutil.ignore_patterns("media"))
-    text_name = f"outline-text-{ts}.tar.gz"
-    text_path = BACKUP_DIR / text_name
-    with tarfile.open(text_path, "w:gz") as tar:
-        tar.add(text_dir, arcname=f"outline-text-{ts}")
-    text_mb = text_path.stat().st_size / 1024 / 1024
-    log.info("Text archive: %s (%.1f MB)", text_name, text_mb)
-
-    # Cleanup temp dirs
-    shutil.rmtree(work_dir, ignore_errors=True)
-    shutil.rmtree(text_dir, ignore_errors=True)
-
-    summary = (
-        f"📦 Outline Backup — {ts}\n"
-        f"• Collections: {col_count}\n"
-        f"• Documents: {doc_count}\n"
-        f"• Media files: {media_count}\n"
-        f"• Text archive: {text_mb:.1f} MB (sent here)\n"
-        f"• Full archive: {full_mb:.1f} MB (local only)"
-    )
-    return str(text_path), str(full_path), summary
+    summary = "\n".join(lines)
+    log.info("Archive dir: %s", backup_dir)
+    return stats, summary
 
 
 # ── Telegram send ─────────────────────────────────────────────────────
@@ -235,16 +185,15 @@ def send_telegram(text: str, file_path: str = None):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
     if TELEGRAM_THREAD_ID:
         payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
-
     requests.post(f"{base}/sendMessage", json=payload, timeout=15)
 
     if file_path and os.path.exists(file_path):
         size = os.path.getsize(file_path)
         if size > 50 * 1024 * 1024:
-            log.warning("File too large for Telegram (%.1f MB)", size / 1024 / 1024)
+            log.info("File too large for Telegram (%.1f MB), skipping", size / 1024 / 1024)
             return
         with open(file_path, "rb") as f:
-            doc_payload = {"chat_id": TELEGRAM_CHAT_ID, "caption": "Text-only backup"}
+            doc_payload = {"chat_id": TELEGRAM_CHAT_ID, "caption": "Full backup archive"}
             if TELEGRAM_THREAD_ID:
                 doc_payload["message_thread_id"] = int(TELEGRAM_THREAD_ID)
             requests.post(
@@ -252,34 +201,32 @@ def send_telegram(text: str, file_path: str = None):
                 files={"document": (os.path.basename(file_path), f)},
                 timeout=120,
             )
-        log.info("Sent to Telegram")
+        log.info("Sent file to Telegram")
 
 
 # ── Cleanup ───────────────────────────────────────────────────────────
 
 def cleanup_old():
-    for d in [BACKUP_DIR, LOCAL_BACKUP_DIR]:
-        if not d.exists():
-            continue
-        backups = sorted(
-            d.glob("outline-*.tar.gz"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for old in backups[KEEP_BACKUPS:]:
-            log.info("Removing old backup: %s", old.name)
-            old.unlink(missing_ok=True)
+    if not LOCAL_BACKUP_DIR.exists():
+        return
+    backups = sorted(
+        LOCAL_BACKUP_DIR.glob("outline-export-*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in backups[KEEP_BACKUPS:]:
+        log.info("Removing old backup: %s", old.name)
+        shutil.rmtree(old, ignore_errors=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────
 
 def main():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     LOCAL_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     log.info("=== Outline Backup Start ===")
     try:
-        text_path, full_path, summary = do_backup()
-        send_telegram(summary, text_path)
+        stats, summary = do_backup()
+        send_telegram(summary)
         cleanup_old()
         log.info("=== Backup Complete ===")
     except Exception as e:
